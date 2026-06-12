@@ -14,7 +14,12 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
 import pandas as pd
 
-MODEL_FILE = os.path.join(os.path.dirname(__file__), "tfidf_model.pkl")
+BASE_DIR = os.path.dirname(__file__)
+
+MODEL_FILES = {
+    "일본": os.path.join(BASE_DIR, "jsh_tfidf_model_japan.pkl"),
+    "한국": os.path.join(BASE_DIR, "jsh_tfidf_model_korea.pkl"),
+}
 
 KEYWORD_MAP = {
     "사원": "temple", "절": "temple", "신사": "shrine", "신전": "shrine",
@@ -31,21 +36,27 @@ KEYWORD_MAP = {
 }
 
 
-def clean_text(text):
+def clean_text_jp(text):
     text = str(text).lower()
     text = re.sub(r"[^a-z぀-鿿\s]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def load_model():
-    with open(MODEL_FILE, "rb") as f:
+def clean_text_kr(text):
+    text = str(text).lower()
+    text = re.sub(r"[^가-힣㄰-㆏\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def load_model(path):
+    with open(path, "rb") as f:
         data = pickle.load(f)
     return data["vectorizer"], data["matrix"], data["activities"]
 
 
-def get_recommendations(query, vectorizer, tfidf_matrix, activity_df, top_n):
-    query_vec = vectorizer.transform([clean_text(query)])
+def get_recommendations(query, vectorizer, tfidf_matrix, activity_df, top_n, country):
+    clean = clean_text_kr(query) if country == "한국" else clean_text_jp(query)
+    query_vec = vectorizer.transform([clean])
     scores = cosine_similarity(query_vec, tfidf_matrix).flatten()
     top_idx = scores.argsort()[::-1][:top_n]
     results = []
@@ -62,39 +73,58 @@ def get_recommendations(query, vectorizer, tfidf_matrix, activity_df, top_n):
 class RecommendApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.vectorizer, self.tfidf_matrix, self.activity_df = load_model()
+        self.models = {}
+        for country, path in MODEL_FILES.items():
+            if os.path.exists(path):
+                self.models[country] = load_model(path)
+        self.current_country = list(self.models.keys())[0]
         self.init_ui()
 
+    @property
+    def vectorizer(self):
+        return self.models[self.current_country][0]
+
+    @property
+    def tfidf_matrix(self):
+        return self.models[self.current_country][1]
+
+    @property
+    def activity_df(self):
+        return self.models[self.current_country][2]
+
     def init_ui(self):
-        self.setWindowTitle("Japan Activity Recommender")
-        self.setMinimumWidth(900)
-        self.setMinimumHeight(500)
+        self.setWindowTitle("Festival & Activity Recommender")
+        self.setMinimumWidth(950)
+        self.setMinimumHeight(550)
 
         layout = QVBoxLayout()
         layout.setSpacing(10)
         layout.setContentsMargins(20, 20, 20, 20)
 
-        # 제목
-        title = QLabel("Japan Activity Recommender")
+        title = QLabel("Festival & Activity Recommender")
         title.setFont(QFont("Arial", 16, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
-        # 필터 영역 (도시 / 시기)
+        # 필터 영역
         filter_layout = QHBoxLayout()
+
+        self.country_combo = QComboBox()
+        self.country_combo.setFixedWidth(100)
+        self.country_combo.setFont(QFont("Arial", 10))
+        self.country_combo.addItems(list(self.models.keys()))
+
         self.city_combo = QComboBox()
-        self.city_combo.setFixedWidth(180)
+        self.city_combo.setFixedWidth(160)
         self.city_combo.setFont(QFont("Arial", 10))
+
         self.month_combo = QComboBox()
-        self.month_combo.setFixedWidth(120)
+        self.month_combo.setFixedWidth(110)
         self.month_combo.setFont(QFont("Arial", 10))
 
-        cities = ["전체"] + sorted(self.activity_df["city"].dropna().unique().tolist())
-        self.city_combo.addItems(cities)
-
-        valid_months = sorted(self.activity_df["month"].dropna().unique().tolist())
-        self.month_combo.addItems(["전체"] + [f"{int(m)}월" for m in valid_months])
-
+        filter_layout.addWidget(QLabel("국가:"))
+        filter_layout.addWidget(self.country_combo)
+        filter_layout.addSpacing(20)
         filter_layout.addWidget(QLabel("도시:"))
         filter_layout.addWidget(self.city_combo)
         filter_layout.addSpacing(20)
@@ -103,13 +133,14 @@ class RecommendApp(QWidget):
         filter_layout.addStretch()
         layout.addLayout(filter_layout)
 
+        self.country_combo.currentTextChanged.connect(self.on_country_changed)
         self.city_combo.currentIndexChanged.connect(self.apply_filter)
         self.month_combo.currentIndexChanged.connect(self.apply_filter)
 
         # 입력 영역
         input_layout = QHBoxLayout()
         self.keyword_input = QLineEdit()
-        self.keyword_input.setPlaceholderText("키워드 입력 (예: pottery craft, food cooking, temple history ...)")
+        self.keyword_input.setPlaceholderText("키워드 입력 (예: 불꽃 야경 / pottery craft / temple history ...)")
         self.keyword_input.setFont(QFont("Arial", 11))
         self.keyword_input.returnPressed.connect(self.search)
 
@@ -146,12 +177,38 @@ class RecommendApp(QWidget):
         self.table.setWordWrap(True)
         layout.addWidget(self.table)
 
-        # 상태 레이블
-        self.status_label = QLabel(f"모델 로드 완료 | 활동 {len(self.activity_df)}개")
+        self.status_label = QLabel()
         self.status_label.setAlignment(Qt.AlignRight)
         layout.addWidget(self.status_label)
 
         self.setLayout(layout)
+        self.refresh_filter_combos()
+
+    def refresh_filter_combos(self):
+        self.city_combo.blockSignals(True)
+        self.month_combo.blockSignals(True)
+
+        self.city_combo.clear()
+        self.month_combo.clear()
+
+        cities = ["전체"] + sorted(self.activity_df["city"].dropna().unique().tolist())
+        self.city_combo.addItems(cities)
+
+        valid_months = sorted(self.activity_df["month"].dropna().unique().tolist())
+        self.month_combo.addItems(["전체"] + [f"{int(m)}월" for m in valid_months])
+
+        self.city_combo.blockSignals(False)
+        self.month_combo.blockSignals(False)
+
+        self.status_label.setText(
+            f"[{self.current_country}] 모델 로드 완료 | 활동 {len(self.activity_df)}개"
+        )
+        self.apply_filter()
+
+    def on_country_changed(self, country):
+        self.current_country = country
+        self.keyword_input.clear()
+        self.refresh_filter_combos()
 
     def get_filtered_df(self):
         filtered_df = self.activity_df.copy()
@@ -173,17 +230,19 @@ class RecommendApp(QWidget):
             self._fill_row(row_idx, row["city"], row["activity"],
                            row.get("month"), row.get("rating"), None)
         self.table.resizeRowsToContents()
-        self.status_label.setText(f"필터 결과: {len(filtered_df)}개 | 키워드 입력 시 유사도 검색")
+        self.status_label.setText(
+            f"[{self.current_country}] 필터 결과: {len(filtered_df)}개 | 키워드 입력 시 유사도 검색"
+        )
 
     def search(self):
         query = self.keyword_input.text().strip()
         if not query:
             return
 
-        # 한국어 입력 처리: 매핑 우선, 없으면 번역
-        has_non_ascii = any(ord(c) > 127 for c in query)
         translated_query = query
-        if has_non_ascii:
+        has_non_ascii = any(ord(c) > 127 for c in query)
+
+        if self.current_country == "일본" and has_non_ascii:
             mapped = " ".join(KEYWORD_MAP.get(w, "") for w in query.split())
             if mapped.strip():
                 translated_query = mapped.strip()
@@ -198,12 +257,11 @@ class RecommendApp(QWidget):
         filtered_indices = filtered_df.index.tolist()
         filtered_matrix = self.tfidf_matrix[filtered_indices]
 
-        if not translated_query:
-            self.apply_filter()
-            return
-
         top_n = self.top_n_spin.value()
-        results = get_recommendations(translated_query, self.vectorizer, filtered_matrix, filtered_df.reset_index(drop=True), top_n)
+        results = get_recommendations(
+            translated_query, self.vectorizer, filtered_matrix,
+            filtered_df.reset_index(drop=True), top_n, self.current_country
+        )
 
         self.table.setRowCount(len(results))
         if not results:
@@ -214,26 +272,35 @@ class RecommendApp(QWidget):
             self._fill_row(row_idx, city, activity, month, rating, score)
 
         self.table.resizeRowsToContents()
-        self.status_label.setText(f"'{query}' 검색 결과: {len(results)}개")
+        self.status_label.setText(f"[{self.current_country}] '{query}' 검색 결과: {len(results)}개")
 
     def _fill_row(self, row_idx, city, activity, month, rating, score):
         self.table.setItem(row_idx, 0, QTableWidgetItem(city))
 
-        month_item = QTableWidgetItem(f"{int(month)}월" if month is not None and pd.notna(month) else "-")
+        month_item = QTableWidgetItem(
+            f"{int(month)}월" if month is not None and pd.notna(month) else "-"
+        )
         month_item.setTextAlignment(Qt.AlignCenter)
         self.table.setItem(row_idx, 1, month_item)
 
-        rating_item = QTableWidgetItem(f"{rating:.1f} ★" if rating is not None and pd.notna(rating) else "-")
+        rating_item = QTableWidgetItem(
+            f"{rating:.1f} ★" if rating is not None and pd.notna(rating) else "-"
+        )
         rating_item.setTextAlignment(Qt.AlignCenter)
         self.table.setItem(row_idx, 2, rating_item)
 
-        activity_ko = self.activity_df.loc[self.activity_df["activity"] == activity, "activity_ko"].values
+        activity_ko = self.activity_df.loc[
+            self.activity_df["activity"] == activity, "activity_ko"
+        ].values
         activity_ko = activity_ko[0] if len(activity_ko) > 0 else ""
-        activity_text = f"{activity}\n{activity_ko}" if activity_ko else activity
+
+        if self.current_country == "한국" or not activity_ko or activity_ko == activity:
+            activity_text = activity
+        else:
+            activity_text = f"{activity}\n{activity_ko}"
         self.table.setItem(row_idx, 3, QTableWidgetItem(activity_text))
 
-        score_text = str(score) if score is not None else "-"
-        score_item = QTableWidgetItem(score_text)
+        score_item = QTableWidgetItem(str(score) if score is not None else "-")
         score_item.setTextAlignment(Qt.AlignCenter)
         self.table.setItem(row_idx, 4, score_item)
 
